@@ -12,7 +12,7 @@ from nalanbot.training import supervised_init, student_forcing, teacher_forcing
 from nalanbot.sims import act_on_states
 from nalanbot.visualizations import JSONCollector
 from nalanbot.metrics import is_tower_built
-from nalanbot.abstracts import SeqSample
+from nalanbot.abstracts import SeqSample, Sample
 from nalanbot.tokenizers import SampleTokenizer, ActionTokenizer
 
 
@@ -92,24 +92,37 @@ class Context:
 
 
 
-class GenerateSample(Resource):
+class AskSample(Resource):
 
     def __init__(self, context: Context):
         self.context = context
 
     def post(self):
         json_data = request.get_json(force=True)
-        self.context.init(**json_data)
+        self.context.init(**json_data['context'])
         samples = self.context.sampling()
         return self.context.sampling(samples)
 
+
+class PredictFromSample(Resource):
+
+    def __init__(self, context: Context):
+        self.context = context
+
+    def post(self):
+        json_data = request.get_json(force=True)
+        self.context.init(**json_data['context'])
+        sample: Sample = Sample(**json_data['sample'])
+        seq_sample: SeqSample = SeqSample.from_sample(sample)
+        return self.context.predict(seq_sample)
 
 def create_app(prefix="/", debug=False):
     app = Flask(__name__)
     api = Api(app)
     context = Context()
 
-    api.add_resource(GenerateSample, prefix, resource_class_args=(context, ))
+    api.add_resource(AskSample, prefix + "/sample", resource_class_args=(context, ))
+    api.add_resource(PredictFromSample, prefix + "/predict", resource_class_args=(context, ))
     app.run(debug=debug)
     return app
 
