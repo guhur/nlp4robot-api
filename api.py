@@ -6,10 +6,11 @@ import os
 from typing import Dict, Any
 from copy import deepcopy
 from flask import Flask, request
-from flask_restful import Resource, Api, abort, reqparse
+from flask_restful import Resource, Api, abort, reqparse, fields, marshal_with
+from flask_cors import CORS
 from nalanbot.experiments import ExperimentManager
-from nalanbot.training import supervised_init, student_forcing, teacher_forcing
-from nalanbot.sims import act_on_states
+from nalanbot.training import supervised_init, student_forcing, teacher_forcing, supervised_default_params
+from nalanbot.sims import act_on_states, BulletBody, BulletManipulator
 from nalanbot.visualizations import JSONCollector
 from nalanbot.metrics import is_tower_built
 from nalanbot.abstracts import SeqSample, Sample
@@ -34,13 +35,14 @@ class Context:
             return
 
         # Update manager with context
-        self.manager = ExperimentManager(**context)
+        self.manager = ExperimentManager(**context, testsets={}, dataset="onthefly", num_workers=0)
+        supervised_default_params(self.manager)
         self.collector = JSONCollector(self.manager)
 
         # Load
         self.policy, opt, datagens, self.sim, self.renderer = supervised_init(self.manager)
-        self.policy, _ = self.manager.load(self.policy, opt)
-        self.dataset = datagens[1].dataset
+        self.policy, _, _ = self.manager.load(self.policy, opt)
+        self.dataset = datagens[0].dataset
         self.sample_tokenizer = SampleTokenizer(
             device=self.manager.get("device"), workspace=self.sim.workspace
         )
@@ -92,16 +94,48 @@ class Context:
 
 
 
+body_fields = {
+        "position": fields.List(fields.Float),
+        "size": fields.List(fields.Float),
+        "shape": fields.String,
+        "color_name": fields.String,
+        "color": fields.List(fields.Float),
+        }
+
+manipulator_fields = {
+        "position": fields.List(fields.Float),
+        "orientation": fields.List(fields.Float),
+        }
+
+state_fields = {
+        "bodies": fields.List(fields.Nested(body_fields)),
+        "manipulator": fields.Nested(manipulator_fields)
+        }
+
+sample_fields = {
+        "sentence": fields.String,
+        "action": fields.List(fields.String),
+        "color": fields.List(fields.String),
+        "position": fields.List(fields.List(fields.Float)),
+        "states": fields.List(fields.Nested(state_fields))
+}
+
 class AskSample(Resource):
 
     def __init__(self, context: Context):
         self.context = context
 
+    @marshal_with(sample_fields, envelope='resource')
     def post(self):
         json_data = request.get_json(force=True)
+
+        if "context" not in json_data:
+            abort(400, message="Missing the context")
+
         self.context.init(**json_data['context'])
-        samples = self.context.sampling()
-        return self.context.sampling(samples)
+        samples: SeqSample = self.context.sampling()
+        sample: Sample = samples.batch[0]
+        return sample
 
 
 class PredictFromSample(Resource):
@@ -111,24 +145,51 @@ class PredictFromSample(Resource):
 
     def post(self):
         json_data = request.get_json(force=True)
-        self.context.init(**json_data['context'])
-        sample: Sample = Sample(**json_data['sample'])
-        seq_sample: SeqSample = SeqSample.from_sample(sample)
-        return self.context.predict(seq_sample)
 
-def create_app(prefix="/", debug=False):
+        if "context" not in json_data:
+            abort(400, message="Missing the context")
+        if "sample" not in json_data:
+            abort(400, message="Missing the sample")
+
+        self.context.init(**json_data['context'])
+
+        # FIXME dirty code
+        import pdb; pdb.set_trace()
+        json_states: Dict = json_data['sample']['states']
+        states = []
+        for state in json_states:
+            manipulator = BulletManipulator(**state['manipulator'])
+            bodies = [BulletBody(**json_body) for json_body in state['bodies']]
+            states.append({
+                "manipulator": manipulator,
+                "bodies": bodies
+                })
+        del json_data['sample']['states']
+
+        sample: Sample = Sample(**json_data['sample'], states=states)
+        seq_sample: SeqSample = SeqSample.from_batch([sample])
+        data: str = self.context.predict(seq_sample)
+        return data
+
+
+def create_app(prefix: str = "/", debug: bool = False) -> Flask:
     app = Flask(__name__)
-    api = Api(app)
+
+    if debug:
+        cors = CORS(app, resources={r"*": {"origins": "*"}})
+
     context = Context()
 
-    api.add_resource(AskSample, prefix + "/sample", resource_class_args=(context, ))
-    api.add_resource(PredictFromSample, prefix + "/predict", resource_class_args=(context, ))
+    api = Api(app)
+    api.add_resource(AskSample, prefix + "/sample/", resource_class_args=(context, ))
+    api.add_resource(PredictFromSample, prefix + "/predict/", resource_class_args=(context, ))
+
     app.run(debug=debug)
     return app
 
 
 if __name__ == '__main__':
-    debug = os.environ.get("API_DEBUG", True)
-    prefix = os.environ.get("API_PREFIX", "/api")
+    debug: bool = bool(os.environ.get("API_DEBUG", True))
+    prefix: str = os.environ.get("API_PREFIX", "/api")
 
-    app = create_app(prefix, debug)
+    app: Flask = create_app(prefix, debug)
