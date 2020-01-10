@@ -8,6 +8,7 @@ from copy import deepcopy
 from flask import Flask, request
 from flask_restful import Resource, Api, abort, reqparse, fields, marshal_with
 from flask_cors import CORS
+import nalanbot as nb
 from nalanbot.experiments import ExperimentManager
 from nalanbot.training import supervised_init, student_forcing, teacher_forcing, supervised_default_params
 from nalanbot.sims import act_on_states, BulletBody, BulletManipulator
@@ -16,44 +17,56 @@ from nalanbot.metrics import is_tower_built
 from nalanbot.abstracts import SeqSample, Sample
 from nalanbot.tokenizers import SampleTokenizer, ActionTokenizer
 
+# As of v0.11, it's the AMT testset
+DEFAULT_DATASET = "dataset-21"
 
 class Context:
 
     def __init__(self):
-        self.manager = None
-        self.dataset = None
-        self.policy = None
-        self.sim = None
-        self.renderer = None
-        self.sample_tokenizer = None
-        self.action_tokenizer = None
-        self.collector = None
-        self.context = {}
+        self.manager: nb.ExperimentManager = None
+        self.dataset: nb.BaseDataset = None
+        self.dataset_name: str = DEFAULT_DATASET
+        self.policy: nb.BasePolicy = None
+        self.sim: nb.BaseSim = None
+        self.renderer: nb.BaseRender = None
+        self.sample_tokenizer: nb.SampleTokenizer = None
+        self.action_tokenizer: nb.ActionTokenizer = None
+        self.collector: JSONCollector = None
+        self.context: Dict[str, Any] = {}
 
     def init(self, **context: Any) -> None:
         if context == self.context:
             return
 
+        if "dataset_name" in context:
+            self.dataset_name = context["dataset_name"]
+
         # Update manager with context
-        self.manager = ExperimentManager(**context, testsets={}, dataset="onthefly", num_workers=0)
+        params = {
+                "testsets": {},
+                "num_workers": 0,
+                **context,
+                }
+        self.manager = ExperimentManager()
         supervised_default_params(self.manager)
         self.collector = JSONCollector(self.manager)
 
         # Load
         self.policy, opt, datagens, self.sim, self.renderer = supervised_init(self.manager)
         self.policy, _, _ = self.manager.load(self.policy, opt)
-        self.dataset = datagens[0].dataset
+
+        dataset_path = nb.get_config("datasets") / self.dataset_name
+        self.dataset = nb.DeterministicLMDBDataset(folder=dataset_path)
         self.sample_tokenizer = SampleTokenizer(
             device=self.manager.get("device"), workspace=self.sim.workspace
         )
         self.action_tokenizer = ActionTokenizer(workspace=self.sim.workspace)
 
-    def sampling(self) -> SeqSample:
+    def sampling(self) -> Sample:
         sample = next(self.dataset)
-        samples = SeqSample.from_batch([sample])
-        return samples
+        return sample
 
-    def _teacher_forcing(self, samples: SeqSample) -> Dict:
+    def _teacher_forcing(self, samples: SeqSample) :
         _, tactions, _ = teacher_forcing(
             self.policy, samples, self.sim, self.renderer, self.sample_tokenizer, self.action_tokenizer
         )
@@ -62,7 +75,7 @@ class Context:
         tf_result = is_tower_built(samples.batch[0], tf_actions[0], tf_states[0])
         return tf_actions[0], tf_states[0], tf_result
 
-    def _student_forcing(self, samples: SeqSample) -> Dict:
+    def _student_forcing(self, samples: SeqSample):
         tsamples, tactions, _ = student_forcing(
             self.policy, samples, self.sim, self.renderer, self.sample_tokenizer, self.action_tokenizer
         )
@@ -133,9 +146,12 @@ class AskSample(Resource):
             abort(400, message="Missing the context")
 
         self.context.init(**json_data['context'])
-        samples: SeqSample = self.context.sampling()
-        sample: Sample = samples.batch[0]
-        return sample
+        sample: Sample = self.context.sampling()
+
+        return {
+            "sample": sample,
+            "dataset_name": self.context.dataset_name
+        }
 
 
 class PredictFromSample(Resource):
@@ -154,7 +170,7 @@ class PredictFromSample(Resource):
         self.context.init(**json_data['context'])
 
         # FIXME dirty code
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         json_states: Dict = json_data['sample']['states']
         states = []
         for state in json_states:
